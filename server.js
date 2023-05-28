@@ -174,8 +174,7 @@ app.get('/player', async (req, res) => {
 })
 
 app.get('/sessions', async (req, res) => {
-  const active = req.headers.active
-  const activeQueryClause = active ? 'WHERE array_length("playersID", 1) IS NULL' : ''
+  console.log('Sessions Request')
   
   const { rows } = await pool.query(`
     SELECT * 
