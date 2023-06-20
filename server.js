@@ -3,7 +3,7 @@ const { Pool, Query } = require('pg');
 const cors = require('cors')
 const bodyParser = require('body-parser');
 const socketIO = require('socket.io');
-
+const util = require('util');
 
 const app = express();
 const port = 3000;
@@ -34,6 +34,8 @@ var players = {};
 var sessions = {};
 var sessionStates = {};
 
+var n = 0;
+
 io.on('connection', (player) => {
   console.log(`Player setup socket connection with sid: ${player.id}`)
   
@@ -60,7 +62,9 @@ io.on('connection', (player) => {
     if (sessions[playerData.sessionID] === undefined) {
       sessions[playerData.sessionID] = {
         'leader': playerData.playerID,
-        'players': [playerData.playerID]
+        'players': [playerData.playerID],
+        'state': 'open',
+        'raceStatus': {}
       };
     
     // if it does exist, send to the connecting player the states of the current players in the session.
@@ -89,6 +93,8 @@ io.on('connection', (player) => {
 
   player.on('message', (data) => {
     data = JSON.parse(data);
+    console.log('\nMessage recieved successfully.\n- Message:')
+    console.log(data);
     player.in(data.chatID).emit('message', JSON.stringify(data));
   })
 
@@ -105,10 +111,69 @@ io.on('connection', (player) => {
     console.log(gameSettings);
     console.log('STARTING');
     io.in(gameSettings.sessionID).emit('startGame', gameSettings);
+    sessions[gameSettings.sessionID]['state'] = 'running';
+    sessions[gameSettings.sessionID]['gameSettings'] = gameSettings;
+    let lastStates = {}
+    for (let playerID of sessions[gameSettings.sessionID]['players']) {
+      sessions[gameSettings.sessionID]['raceStatus'][playerID] = false;
+      lastStates[playerID] = {};
+    }
+    sessions[gameSettings.sessionID]['lastStates'] = lastStates;
+    console.log(sessions);
+  })
+
+  player.on('gameInitialized', (playerInfo) => {
+    console.log('GAMEINIT');
+    sessions[playerInfo.sessionID]['raceStatus'][playerInfo.playerID] = 'ready';
+    console.log(sessions[playerInfo.sessionID]['raceStatus']);
+    let allReady = true;
+    for (let [playerID, raceStatus] of Object.entries(sessions[playerInfo.sessionID]['raceStatus'])) {
+      if (raceStatus === false) {
+        allReady = false;
+      }
+    }
+    if (allReady) {
+      io.in(playerInfo.sessionID).emit('startRace', {});
+    }
   })
 
   player.on('carState', (state) => {
+    n++;
     player.to(state.sessionID).emit('carState', state);
+    sessions[state.sessionID]['lastStates'][state.playerID] = state;
+    if (n % 60 === 0) {
+      console.log('- Sessions after 60 emits');
+      console.log(util.inspect(sessions, false, null, true));
+    }
+  })
+
+  player.on('reconnectRequest', (data) => {
+    console.log('Emitting reconnectionData');
+    player.join(data.sessionID);
+    
+    console.log(data)
+    io.to(player.id).emit('reconnectionData',
+      {
+        'gameSettings': sessions[data.sessionID]['gameSettings'],
+        'lastState': sessions[data.sessionID]['lastStates'][data.playerID]
+      }
+    )
+  })
+
+  player.on('raceFinished', (data) => {
+    sessions[data.sessionID]['raceStatus'][data.playerID] = data.time;
+    console.log(sessions[data.sessionID]['raceStatus'])
+    let allDone = true;
+    for (let [playerID, raceStatus] of Object.entries(sessions[data.sessionID]['raceStatus'])) {
+      if (raceStatus === 'ready') {
+        allDone = false;
+      }
+    }
+    if (allDone) {
+      console.log('sending end race');
+      io.in(data.sessionID).emit('endRace', sessions[data.sessionID]['raceStatus']);
+      sessions[data.sessionID]['state'] = 'closed'
+    }
   })
 
   player.on('disconnecting', () => {
@@ -121,24 +186,28 @@ io.on('connection', (player) => {
 
       // remove player out of the list of players.
       if (index !== -1) {
-        playerIDs.splice(index, 1);
-        io.to(sessionID).emit('playerDisconnected', playerIDToRemove)
-        console.log(`- Removed player: ${playerIDToRemove} from session :${sessionID}`);
-
-        // if the session is now empty delete it.
-        if (playerIDs.length === 0) {
-          console.log(`- Session is empty, deleting session: ${sessionID}`);
-          sessions[sessionID] = null;
-          delete sessions[sessionID];
+        if (sessions[sessionID]['state'] !== 'running') {
+          playerIDs.splice(index, 1);
+          io.to(sessionID).emit('playerDisconnected', playerIDToRemove)
+          console.log(`- Removed player: ${playerIDToRemove} from session :${sessionID}`);
+  
+          // if the session is now empty delete it.
+          if (playerIDs.length === 0) {
+            console.log(`- Session is empty, deleting session: ${sessionID}`);
+            sessions[sessionID] = null;
+            delete sessions[sessionID];
+          }
         }
       }
 
       // remove the player state.
       if (Object.keys(sessionStates).includes(playerIDToRemove)) {
-        console.log(`- Deleting player state: ${playerIDToRemove}`);
+        console.log(`- Deleting player session state: ${playerIDToRemove}`);
         sessionStates[playerIDToRemove] = null
         delete sessionStates[playerIDToRemove];
       }
+
+      // player.disconnect();
 
       console.log('\n------------Sessions Status:------------\n- Sessions:')
       console.log(sessions)
@@ -174,7 +243,7 @@ app.get('/player', async (req, res) => {
 })
 
 app.get('/sessions', async (req, res) => {
-  console.log('Sessions Request')
+  const playerID = req.headers.playerid
   
   const { rows } = await pool.query(`
     SELECT * 
@@ -182,8 +251,11 @@ app.get('/sessions', async (req, res) => {
   `)
 
   for (let i = 0; i < rows.length; i++) {
+    currentSession = sessions[rows[i]['sessionID']]
     if (sessions[rows[i]['sessionID']] !== undefined) {
-      rows[i]['playersID'] = sessions[rows[i]['sessionID']]['players'];
+      rows[i]['playersID'] = currentSession['players'];
+      rows[i]['state'] = currentSession['state'];
+      rows[i]['reconnectable'] = (currentSession['players'].includes(playerID) && (currentSession['state'] === 'running'));
     } 
   }
   
@@ -229,7 +301,6 @@ app.get('/messages', async (req, res) => {
     FROM game_schema."Chats"
     WHERE "sessionID" = '${sessionID}'
   `);
-
   if (chatRows.length === 0) {
     return res.status(404).json({ error: 'Chat not found' });
   }
@@ -238,9 +309,10 @@ app.get('/messages', async (req, res) => {
   const messagesID = chat.messagesID;
 
   const { rows: messageRows } = await pool.query(`
-    SELECT *
-    FROM game_schema."Messages"
-    WHERE "messageID" = ANY($1)
+    SELECT m.*, p.username, p."imageUrl"
+    FROM game_schema."Messages" m
+    JOIN game_schema."Players" p ON m.from = p."playerID"
+    WHERE m."messageID" = ANY($1);
   `, [messagesID]);
 
   res.json(messageRows);
